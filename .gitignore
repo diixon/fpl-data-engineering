@@ -1,0 +1,17 @@
+.env
+config.py
+
+__pycache__/
+*.pyc
+
+# Virtual environment — reproducible from requirements.txt
+venv/
+.venv/
+
+# Raw/generated data — reproducible by running the ingestion script
+data/
+*.json
+*.csv
+
+# Docker-generated volumes — reproducible by docker compose up
+docker-volumes/
