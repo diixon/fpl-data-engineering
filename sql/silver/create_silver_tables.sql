@@ -70,6 +70,7 @@ source_run_id bigint not null
 create table silver_player_gameweek_stats(
 player_id int,
 gameweek int,
+transfers_in_event int not null,
 minutes int not null,
 goals_scored int not null,
 assists int not null,

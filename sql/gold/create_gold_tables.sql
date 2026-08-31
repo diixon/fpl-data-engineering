@@ -27,9 +27,15 @@ injury_status text not null check(injury_status in ('available', 'injured', 'dou
 -- (~600 players x 38 gameweeks = 22,000+ rows/season). Denormalizing here 
 -- would multiply storage cost and make any name correction expensive across 
 -- thousands of rows, unlike the ~600-row players table where that cost is trivial.
+--
+-- Being append-only (like player_price_history and fixture_results), this 
+-- table has no automatic safety net if bad data lands in it - so load_date 
+-- and source_run_id are kept here too, for traceability back to the exact 
+-- pipeline run that produced any given row.
 create table player_gameweek_performance(
 player_id int,
 gameweek int,
+transfers_in_event int not null,
 minutes int not null,
 goals_scored int not null,
 assists int not null,
@@ -39,6 +45,9 @@ bonus int not null,
 bps int not null,
 expected_goals numeric(4,2) not null,
 expected_assists numeric(4,2) not null,
+load_date timestamp not null,
+source_run_id bigint not null,
+constraint fk_pgp_pr_id foreign key (source_run_id) references pipeline_runs(run_id),
 constraint pgp_p_id foreign key (player_id) references players(player_id),
 constraint pgp_pk primary key (player_id, gameweek)
 );
