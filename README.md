@@ -55,28 +55,22 @@ I designed the tables around 6 real questions a dashboard should answer:
 6. Show which players are injured or doubtful right now
 
 ## Project structure
+
+```text
 sql/
-
-bronze/ - Bronze layer table definitions
-
-silver/ - Silver layer table definitions
-
-gold/ - Gold layer table definitions
+├── bronze/                 # Bronze layer table definitions
+├── silver/                 # Silver layer table definitions
+└── gold/                   # Gold layer table definitions
 
 src/
-
-db_utils.py - shared database connection logic
-
-ingestion/ - scripts that pull data from the FPL API into Bronze
-
-quality_checks/ - data quality checks (planned)
-
-transformation/ - Bronze to Silver to Gold logic (planned)
+├── db_utils.py             # Shared database connection logic
+├── ingestion/              # Scripts that pull data from the FPL API into Bronze
+├── quality_checks/         # Data quality checks (planned)
+└── transformation/         # Bronze to Silver to Gold logic (planned)
 
 docs/
-
-schema-design.md - my Gold schema design notes
-
+└── schema-design.md        # My Gold schema design notes
+```
 ## Current progress
 
 - [x] Full database design (Bronze, Silver, Gold - 16 tables)
