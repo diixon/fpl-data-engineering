@@ -55,3 +55,45 @@ I designed the tables around 6 real questions a dashboard should answer:
 6. Show which players are injured or doubtful right now
 
 ## Project structure
+sql/
+
+bronze/ - Bronze layer table definitions
+
+silver/ - Silver layer table definitions
+
+gold/ - Gold layer table definitions
+
+src/
+
+db_utils.py - shared database connection logic
+
+ingestion/ - scripts that pull data from the FPL API into Bronze
+
+quality_checks/ - data quality checks (planned)
+
+transformation/ - Bronze to Silver to Gold logic (planned)
+
+docs/
+
+schema-design.md - my Gold schema design notes
+
+## Current progress
+
+- [x] Full database design (Bronze, Silver, Gold - 16 tables)
+- [x] Ingestion script for `bootstrap-static` (players, teams, element types)
+- [ ] Ingestion script for `fixtures`
+- [ ] Ingestion script for `event/{gw}/live`
+- [ ] Data quality checks (Gate 1, Gate 2)
+- [ ] Silver transformation logic
+- [ ] Gold population logic
+- [ ] Docker + Docker Compose
+- [ ] Airflow orchestration
+- [ ] Deployment on Azure
+
+## How I built this
+
+I did not write code first. I planned the whole architecture on paper 
+before writing any SQL or Python - the data flow, the reliability design 
+(retries, monitoring), the database schema, all of it. I only started 
+coding once I understood *why* each piece existed, not just *how* to 
+build it.
