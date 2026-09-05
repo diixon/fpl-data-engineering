@@ -54,6 +54,34 @@ I designed the tables around 6 real questions a dashboard should answer:
 5. Compare a player's actual points with their expected points (xG/xA)
 6. Show which players are injured or doubtful right now
 
+## Bronze ingestion
+
+I built three Python scripts that pull data from the FPL API into my 
+Bronze tables:
+
+- `ingest_bootstrap_static.py` - pulls players, teams, and element types 
+  (player positions) from the `bootstrap-static` endpoint
+- `ingest_fixtures.py` - pulls all fixtures from the `fixtures` endpoint
+- `ingest_event.py` - pulls per-player gameweek stats from the 
+  `event/{gw}/live` endpoint, but only once a gameweek is fully finished 
+  (this table has a unique constraint per player per gameweek, so I can't 
+  pull the same gameweek twice)
+
+Every script tracks its own run in `pipeline_runs`, and uses a try/except 
+with rollback - if something fails partway through, nothing gets partially 
+saved. I tested this failure path on purpose, with a deliberate bug, to 
+make sure it actually works, not just assumed it works.
+
+I also calculate `snapshot_type` dynamically now, instead of hardcoding it. 
+For players and teams, I check the current gameweek's deadline/live/finished 
+status once per run. For fixtures, I check each fixture's own `started`/
+`finished` fields, since every fixture can be in a different state at the 
+same time.
+
+Shared logic (the database connection, and the reusable ingestion function 
+for JSON-based tables) lives in `src/db_utils.py`, so all three scripts 
+reuse the same tested code instead of repeating it.
+
 ## Project structure
 
 ```text
@@ -63,7 +91,7 @@ sql/
 └── gold/                   # Gold layer table definitions
 
 src/
-├── db_utils.py             # Shared database connection logic
+├── db_utils.py             # Shared database connection and shared ingestion logic
 ├── ingestion/              # Scripts that pull data from the FPL API into Bronze
 ├── quality_checks/         # Data quality checks (planned)
 └── transformation/         # Bronze to Silver to Gold logic (planned)
@@ -71,12 +99,15 @@ src/
 docs/
 └── schema-design.md        # My Gold schema design notes
 ```
+
 ## Current progress
 
 - [x] Full database design (Bronze, Silver, Gold - 16 tables)
 - [x] Ingestion script for `bootstrap-static` (players, teams, element types)
-- [ ] Ingestion script for `fixtures`
-- [ ] Ingestion script for `event/{gw}/live`
+- [x] Ingestion script for `fixtures`
+- [x] Ingestion script for `event/{gw}/live` (gated on gameweek being finished)
+- [x] Dynamic snapshot_type logic (no more hardcoded values)
+- [x] Reusable, DRY ingestion functions shared across scripts
 - [ ] Data quality checks (Gate 1, Gate 2)
 - [ ] Silver transformation logic
 - [ ] Gold population logic
@@ -91,3 +122,10 @@ before writing any SQL or Python - the data flow, the reliability design
 (retries, monitoring), the database schema, all of it. I only started 
 coding once I understood *why* each piece existed, not just *how* to 
 build it.
+
+I also debugged real bugs along the way instead of avoiding them - a 
+tuple-unpacking bug that silently gave wrong results, a Python import 
+that accidentally re-ran an entire script as a side effect, and a schema 
+gap I found by checking my tables against my own 6 dashboard 
+questions. Each one taught me something I would not have learned by 
+just copying working code.
