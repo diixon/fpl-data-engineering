@@ -2,50 +2,47 @@
 
 ## About this project
 
-This is my portfolio project. I am a final-year Computer Science student, 
-and I am moving from Data Analyst work into Data Engineering. I built this 
-project to practice real Data Engineering skills, not just data analysis.
+This project is an end-to-end data pipeline for Fantasy Premier League 
+(FPL) data. It pulls live data from the official FPL API, stores it, 
+cleans it, and prepares it for a dashboard.
 
-I use Fantasy Premier League (FPL) data. I chose this topic because I like 
-football, and because the FPL API gives real, live data for free.
+I built this as a portfolio project to show real Data Engineering skills: 
+pipeline design, data quality checks, and a proper database structure - 
+not just writing queries on top of existing data.
 
-## What I want to learn
+## Tech stack
 
-Before this project, I only knew SQL Server, Python, and pandas. In this 
-project, I want to use new tools:
-
-- PostgreSQL (instead of SQL Server)
-- DBeaver (instead of SSMS)
-- psycopg (version 3) to connect Python to Postgres
-- Docker and Airflow (later stages)
-- Azure (for deployment, later stage)
+- PostgreSQL - main database
+- Python (psycopg v3) - ingestion and quality check scripts
+- DBeaver - database client
+- Docker + Airflow - orchestration (planned)
+- Azure - deployment (planned)
 
 ## Architecture
 
 I use a Medallion Architecture: Bronze, Silver, Gold.
 
-- **Bronze**: raw data, exactly as it comes from the FPL API. I store it as 
-  JSON, with no changes. This way, I always have a safe copy if something 
-  goes wrong later.
-- **Silver**: cleaned and typed data. I remove fields I don't need, and I 
-  fix data types (for example, I convert player price from a raw number 
-  to a real decimal value).
-- **Gold**: final tables, ready for a dashboard. Some tables here are 
-  denormalized on purpose, to make dashboard queries fast and simple.
+- **Bronze**: raw data, exactly as it comes from the FPL API. Stored as 
+  JSON, with no changes. This keeps a safe, unmodified copy in case 
+  anything downstream needs to be reprocessed.
+- **Silver**: cleaned and typed data. Fields are extracted from the raw 
+  JSON, converted to the right types, and standardized (for example, 
+  player price is converted from a raw integer into a real decimal value).
+- **Gold**: final tables, ready for a dashboard. Some tables are 
+  denormalized on purpose, so dashboard queries stay fast and simple.
 
-I also built a `pipeline_runs` table. This table tracks every ingestion 
-attempt - not just the final result. If something fails, I can see exactly 
-when it failed and why, on the same day, instead of finding out later.
+A `pipeline_runs` table tracks every ingestion attempt, not just the final 
+result. If something fails, I can see exactly when it failed and why, on 
+the same day, instead of finding out later.
 
 ## Database design
 
-I designed 16 tables in total (6 Bronze, 5 Silver, 5 Gold). Every table 
-and every column has a real reason behind it. I wrote comments in all my 
-SQL files to explain my decisions - for example, why some tables are 
-denormalized and others are not, and why some tables need traceability 
-columns (`load_date`, `source_run_id`) and others don't.
+16 tables in total (6 Bronze, 5 Silver, 5 Gold). Every table and column 
+has a reason behind it, documented directly in the SQL files - why some 
+tables are denormalized and others are not, why some tables carry 
+traceability columns (`load_date`, `source_run_id`) and others don't.
 
-I designed the tables around 6 real questions a dashboard should answer:
+The schema is built around 6 real questions a dashboard needs to answer:
 
 1. Show all midfielders under £8.0m, sorted by total points
 2. Find the best points-per-price value
@@ -56,31 +53,66 @@ I designed the tables around 6 real questions a dashboard should answer:
 
 ## Bronze ingestion
 
-I built three Python scripts that pull data from the FPL API into my 
-Bronze tables:
+Three ingestion scripts pull data from the FPL API into Bronze:
 
-- `ingest_bootstrap_static.py` - pulls players, teams, and element types 
-  (player positions) from the `bootstrap-static` endpoint
-- `ingest_fixtures.py` - pulls all fixtures from the `fixtures` endpoint
-- `ingest_event.py` - pulls per-player gameweek stats from the 
-  `event/{gw}/live` endpoint, but only once a gameweek is fully finished 
-  (this table has a unique constraint per player per gameweek, so I can't 
-  pull the same gameweek twice)
+- `ingest_bootstrap_static.py` - players, teams, and element types 
+  (player positions), from the `bootstrap-static` endpoint
+- `ingest_fixtures.py` - all fixtures, from the `fixtures` endpoint
+- `ingest_event.py` - per-player gameweek stats, from `event/{gw}/live`, 
+  but only once a gameweek is fully finished (this table has a unique 
+  constraint per player per gameweek, so the same gameweek can't be 
+  pulled twice)
 
-Every script tracks its own run in `pipeline_runs`, and uses a try/except 
-with rollback - if something fails partway through, nothing gets partially 
-saved. I tested this failure path on purpose, with a deliberate bug, to 
-make sure it actually works, not just assumed it works.
+Every script tracks its own run in `pipeline_runs`, with a try/except and 
+rollback - if something fails partway through, nothing gets partially 
+saved. The failure path is tested with a deliberate bug, to confirm the 
+rollback and error logging actually work, not just assumed.
 
-I also calculate `snapshot_type` dynamically now, instead of hardcoding it. 
-For players and teams, I check the current gameweek's deadline/live/finished 
-status once per run. For fixtures, I check each fixture's own `started`/
-`finished` fields, since every fixture can be in a different state at the 
-same time.
+`snapshot_type` is calculated dynamically, not hardcoded. For players and 
+teams, it checks the current gameweek's deadline/live/finished status once 
+per run. For fixtures, each fixture is checked individually, since matches 
+in the same gameweek can be in different states at the same time.
 
-Shared logic (the database connection, and the reusable ingestion function 
-for JSON-based tables) lives in `src/db_utils.py`, so all three scripts 
-reuse the same tested code instead of repeating it.
+Shared logic (database connection, and a reusable ingestion function for 
+JSON-based tables) lives in `src/db_utils.py`, so all scripts reuse the 
+same tested code instead of repeating it.
+
+## Gate 1 - Data Quality Checks
+
+Before Bronze data can be trusted for Silver, it goes through quality 
+checks. Table constraints (NOT NULL, foreign keys) only protect the outer 
+shape of a row - they can't see inside the raw JSON itself, so a malformed 
+or incomplete API response could still insert without error. Gate 1 closes 
+that gap.
+
+Results are recorded in a `quality_check_results` table - which table, 
+which rule, how many rows were checked, how many failed, and the actual 
+failed ids (not just a count, since a count alone isn't enough to act on). 
+This table doesn't link to a single `pipeline_runs.run_id`, since a check 
+usually looks at data from many different ingestion runs mixed together.
+
+Gate 1 currently covers:
+- `bronze_players` - required fields exist inside raw_json
+- `bronze_fixtures` - required fields always present, plus a separate rule 
+  for score fields, checked only on finished matches
+- `bronze_teams` - required fields always present
+- `bronze_event` - required stats exist inside the nested stats object
+
+`bronze_element_types` doesn't need a check at all - that table uses real, 
+typed columns instead of JSONB, so NOT NULL constraints already reject any 
+row missing a required field before it's ever inserted. There's no hidden 
+JSON blob where a problem could slip through, so there's nothing for Gate 1 
+to catch that the table doesn't already enforce on its own.
+
+The check logic (`run_quality_check`) is shared and reusable, in 
+`src/quality_checks/quality_utils.py`.
+
+When a check finds bad rows, Silver won't block entirely (that would also 
+skip the good rows for no reason) and won't just log a warning and let bad 
+data through either. Instead, Silver will exclude the specific rows listed 
+in `failed_ids`, process everything else normally, and log what was 
+skipped. This isn't wired in yet - it will be built alongside Silver 
+transformation logic.
 
 ## Project structure
 
@@ -88,16 +120,17 @@ reuse the same tested code instead of repeating it.
 sql/
 ├── bronze/                 # Bronze layer table definitions
 ├── silver/                 # Silver layer table definitions
-└── gold/                   # Gold layer table definitions
+├── gold/                   # Gold layer table definitions
+└── quality_checks/         # quality_check_results table definition
 
 src/
-├── db_utils.py             # Shared database connection and shared ingestion logic
-├── ingestion/              # Scripts that pull data from the FPL API into Bronze
-├── quality_checks/         # Data quality checks (planned)
+├── db_utils.py             # shared database connection and shared ingestion logic
+├── ingestion/              # scripts that pull data from the FPL API into Bronze
+├── quality_checks/         # Gate 1 data quality checks (Bronze layer)
 └── transformation/         # Bronze to Silver to Gold logic (planned)
 
 docs/
-└── schema-design.md        # My Gold schema design notes
+└── schema-design.md        # my Gold schema design notes
 ```
 
 ## Current progress
@@ -106,26 +139,12 @@ docs/
 - [x] Ingestion script for `bootstrap-static` (players, teams, element types)
 - [x] Ingestion script for `fixtures`
 - [x] Ingestion script for `event/{gw}/live` (gated on gameweek being finished)
-- [x] Dynamic snapshot_type logic (no more hardcoded values)
+- [x] Dynamic snapshot_type logic
 - [x] Reusable, DRY ingestion functions shared across scripts
-- [ ] Data quality checks (Gate 1, Gate 2)
+- [x] Gate 1 quality checks for all applicable Bronze tables
 - [ ] Silver transformation logic
+- [ ] Gate 2 quality checks
 - [ ] Gold population logic
 - [ ] Docker + Docker Compose
 - [ ] Airflow orchestration
 - [ ] Deployment on Azure
-
-## How I built this
-
-I did not write code first. I planned the whole architecture on paper 
-before writing any SQL or Python - the data flow, the reliability design 
-(retries, monitoring), the database schema, all of it. I only started 
-coding once I understood *why* each piece existed, not just *how* to 
-build it.
-
-I also debugged real bugs along the way instead of avoiding them - a 
-tuple-unpacking bug that silently gave wrong results, a Python import 
-that accidentally re-ran an entire script as a side effect, and a schema 
-gap I found by checking my tables against my own 6 dashboard 
-questions. Each one taught me something I would not have learned by 
-just copying working code.
