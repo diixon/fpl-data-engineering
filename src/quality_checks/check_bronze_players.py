@@ -4,16 +4,21 @@ from src.quality_checks.quality_utils import run_quality_check
 
 def check_bronze_players(conn):
     """
-    Gate 1 check for bronze_players. My table's own constraints (NOT NULL,
-    foreign keys) only protect the outer shape of each row - player_id
-    exists, raw_json exists, run_id is valid. They cannot see INSIDE the
-    raw_json blob. If the FPL API ever sent a player missing a field like
-    now_cost, my table would insert it fine, with no error at all.
+    Two rules for bronze_players:
 
-    This check looks inside raw_json for the fields Silver actually needs
-    later (id, web_name, element_type, team, now_cost, status) - catching
-    a problem here, right when it enters Bronze, instead of finding out
-    later when Silver's conversion logic breaks or produces garbage.
+    1. required_keys_missing - my table's own constraints (NOT NULL,
+       foreign keys) only protect the outer shape of a row. They cannot
+       see INSIDE the raw_json blob. If the FPL API ever sent a player
+       missing a field like now_cost, my table would insert it fine, with
+       no error at all. This rule catches that gap.
+
+    2. invalid_status_value - even when 'status' exists, its value might
+       not be one of the 5 codes I actually know how to translate ('a',
+       'i', 'd', 's', 'u'). My Silver transformation maps unknown codes to
+       'unknown' on purpose, instead of silently guessing a default - so
+       this rule flags them here in Bronze, where I can actually notice
+       and investigate, rather than letting a bad code get silently
+       mislabeled downstream.
     """
     run_quality_check(
         conn,
@@ -29,6 +34,18 @@ def check_bronze_players(conn):
                OR raw_json->>'team' IS NULL
                OR raw_json->>'now_cost' IS NULL
                OR raw_json->>'status' IS NULL
+        """
+    )
+
+    run_quality_check(
+        conn,
+        table_name="bronze_players",
+        rule_name="invalid_status_value",
+        count_query="SELECT COUNT(*) FROM bronze_players",
+        failed_ids_query="""
+            SELECT player_id
+            FROM bronze_players
+            WHERE raw_json->>'status' NOT IN ('a', 'i', 'd', 's', 'u')
         """
     )
 
