@@ -22,7 +22,6 @@ def check_bronze_event(conn):
             SELECT player_id
             FROM bronze_event
             WHERE raw_json->>'id' IS NULL
-               OR raw_json->'stats'->>'transfers_in_event' IS NULL
                OR raw_json->'stats'->>'minutes' IS NULL
                OR raw_json->'stats'->>'goals_scored' IS NULL
                OR raw_json->'stats'->>'assists' IS NULL

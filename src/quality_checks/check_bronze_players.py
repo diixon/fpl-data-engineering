@@ -34,6 +34,7 @@ def check_bronze_players(conn):
                OR raw_json->>'team' IS NULL
                OR raw_json->>'now_cost' IS NULL
                OR raw_json->>'status' IS NULL
+               OR raw_json->>'transfers_in_event' IS NULL
         """
     )
 
