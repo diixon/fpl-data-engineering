@@ -4,7 +4,7 @@
 
 This project is an end-to-end data pipeline for Fantasy Premier League 
 (FPL) data. It pulls live data from the official FPL API, stores it, 
-cleans it, and prepares it for a dashboard.
+cleans it, validates it, and prepares it for a dashboard.
 
 I built this as a portfolio project to show real Data Engineering skills: 
 pipeline design, data quality checks, and a proper database structure - 
@@ -13,7 +13,7 @@ not just writing queries on top of existing data.
 ## Tech stack
 
 - PostgreSQL - main database
-- Python (psycopg v3) - ingestion and quality check scripts
+- Python (psycopg v3) - ingestion, quality check, and transformation scripts
 - DBeaver - database client
 - Docker + Airflow - orchestration (planned)
 - Azure - deployment (planned)
@@ -65,54 +65,89 @@ Three ingestion scripts pull data from the FPL API into Bronze:
 
 Every script tracks its own run in `pipeline_runs`, with a try/except and 
 rollback - if something fails partway through, nothing gets partially 
-saved. The failure path is tested with a deliberate bug, to confirm the 
-rollback and error logging actually work, not just assumed.
-
-`snapshot_type` is calculated dynamically, not hardcoded. For players and 
-teams, it checks the current gameweek's deadline/live/finished status once 
-per run. For fixtures, each fixture is checked individually, since matches 
-in the same gameweek can be in different states at the same time.
+saved. `snapshot_type` is calculated dynamically for players, teams, and 
+fixtures, based on real gameweek/deadline/match state, not hardcoded.
 
 Shared logic (database connection, and a reusable ingestion function for 
-JSON-based tables) lives in `src/db_utils.py`, so all scripts reuse the 
-same tested code instead of repeating it.
+JSON-based tables) lives in `src/db_utils.py`.
 
-## Gate 1 - Data Quality Checks
+## Gate 1 - Bronze Data Quality Checks
 
-Before Bronze data can be trusted for Silver, it goes through quality 
-checks. Table constraints (NOT NULL, foreign keys) only protect the outer 
-shape of a row - they can't see inside the raw JSON itself, so a malformed 
-or incomplete API response could still insert without error. Gate 1 closes 
-that gap.
+Table constraints (NOT NULL, foreign keys) only protect the outer shape 
+of a row - they can't see inside the raw JSON itself, so a malformed or 
+incomplete API response could still insert without error. Gate 1 closes 
+that gap by checking what's actually inside the JSON.
 
 Results are recorded in a `quality_check_results` table - which table, 
 which rule, how many rows were checked, how many failed, and the actual 
-failed ids (not just a count, since a count alone isn't enough to act on). 
-This table doesn't link to a single `pipeline_runs.run_id`, since a check 
-usually looks at data from many different ingestion runs mixed together.
+failed ids (not just a count, since a count alone isn't enough to act on).
 
-Gate 1 currently covers:
-- `bronze_players` - required fields exist inside raw_json
-- `bronze_fixtures` - required fields always present, plus a separate rule 
-  for score fields, checked only on finished matches
+Gate 1 covers:
+- `bronze_players` - required fields exist inside raw_json, and status 
+  codes are one of the 5 known values (an unexpected code is flagged here 
+  rather than silently mapped to a default downstream)
+- `bronze_fixtures` - required fields always present, and score fields 
+  checked only on finished matches
 - `bronze_teams` - required fields always present
 - `bronze_event` - required stats exist inside the nested stats object
 
-`bronze_element_types` doesn't need a check at all - that table uses real, 
-typed columns instead of JSONB, so NOT NULL constraints already reject any 
-row missing a required field before it's ever inserted. There's no hidden 
-JSON blob where a problem could slip through, so there's nothing for Gate 1 
-to catch that the table doesn't already enforce on its own.
+`bronze_element_types` needs no check - it uses real typed columns, not 
+JSONB, so NOT NULL constraints already catch everything a check would.
 
 The check logic (`run_quality_check`) is shared and reusable, in 
 `src/quality_checks/quality_utils.py`.
 
-When a check finds bad rows, Silver won't block entirely (that would also 
-skip the good rows for no reason) and won't just log a warning and let bad 
-data through either. Instead, Silver will exclude the specific rows listed 
-in `failed_ids`, process everything else normally, and log what was 
-skipped. This isn't wired in yet - it will be built alongside Silver 
-transformation logic.
+## Silver transformation
+
+Bronze data is cleaned, typed, and standardized into Silver tables:
+
+- `transform_players.py` - converts price, translates status codes into 
+  full words, picks the latest snapshot per player, excludes rows flagged 
+  by Gate 1
+- `transform_teams.py` - straight extraction and type casting
+- `transform_fixtures.py` - only finished matches, filtered before ranking 
+  snapshots (so a live snapshot can never outrank a finished one)
+- `transform_element_types.py` - a simple flattened copy, deduplicated 
+  since this table gets a new row inserted daily
+- `transform_player_gameweek_stats.py` - the most complex one: joins two 
+  Bronze sources (`bronze_event` for match stats, `bronze_players` for 
+  transfer counts, since that field only exists in one of the two)
+
+All Silver tables use `ON CONFLICT DO UPDATE`, making every script safe 
+to re-run. Rows that failed a Gate 1 check are excluded here - not 
+blocked entirely, not silently let through, just left out and logged, so 
+good data isn't held back by a few bad rows.
+
+## Gold population
+
+Silver data is joined and denormalized into the final, dashboard-ready 
+Gold layer:
+
+- `populate_gold_teams.py` / `populate_gold_players.py` - players 
+  denormalizes position and team name directly (a deliberate trade-off: 
+  cheap here since this table is small, keeps dashboard queries simple)
+- `populate_gold_fixture_results.py` - joins the teams table twice (once 
+  for home, once for away) to get both team names
+- `populate_gold_player_gameweek_performance.py` - kept normalized on 
+  purpose, since this table grows every gameweek and denormalizing would 
+  multiply storage cost for no real benefit
+- `populate_gold_player_price_history.py` - the one Gold table with no 
+  direct Silver source; it reads Bronze directly to detect real price 
+  changes (`cost_change_event != 0`), and only creates a row when a 
+  player's price actually moved that gameweek
+
+## Gate 2 - Silver to Gold reconciliation
+
+Gate 1 checks the raw source data. Gate 2 checks a narrower, more honest 
+thing: whether my own transformation logic silently lost rows during a 
+join. `check_gold_reconciliation.py` compares row counts between each 
+Silver table and its Gold target - they should always match, since none 
+of these transformations intentionally filter anything out.
+
+This check does not catch every possible bug - a mistake that keeps the 
+row count the same (like a home/away team swap) would not be caught here. 
+It only catches the "rows disappeared" class of bug, which is a real and 
+common failure mode for JOIN-based transformations.
 
 ## Project structure
 
@@ -133,18 +168,17 @@ docs/
 └── schema-design.md        # my Gold schema design notes
 ```
 
+
 ## Current progress
 
 - [x] Full database design (Bronze, Silver, Gold - 16 tables)
-- [x] Ingestion script for `bootstrap-static` (players, teams, element types)
-- [x] Ingestion script for `fixtures`
-- [x] Ingestion script for `event/{gw}/live` (gated on gameweek being finished)
+- [x] Bronze ingestion for all three FPL API endpoints
 - [x] Dynamic snapshot_type logic
 - [x] Reusable, DRY ingestion functions shared across scripts
 - [x] Gate 1 quality checks for all applicable Bronze tables
-- [ ] Silver transformation logic
-- [ ] Gate 2 quality checks
-- [ ] Gold population logic
+- [x] Silver transformation for all 5 tables
+- [x] Gold population for all 5 tables
+- [x] Gate 2 row-count reconciliation check
 - [ ] Docker + Docker Compose
 - [ ] Airflow orchestration
 - [ ] Deployment on Azure
