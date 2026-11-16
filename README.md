@@ -2,45 +2,32 @@
 
 ## About this project
 
-This project is an end-to-end data pipeline for Fantasy Premier League 
-(FPL) data. It pulls live data from the official FPL API, stores it, 
-cleans it, validates it, and prepares it for a dashboard.
+This project is an end-to-end data pipeline for Fantasy Premier League (FPL) data. It pulls live data from the official FPL API, stores it, cleans it, validates it, and prepares it for a dashboard.
 
-I built this as a portfolio project to show real Data Engineering skills: 
-pipeline design, data quality checks, and a proper database structure - 
-not just writing queries on top of existing data.
+I built this as a portfolio project to demonstrate real Data Engineering skills: pipeline design, data quality checks, orchestration, containerization, and proper database structuring—not just writing queries on top of existing data.
 
-## Tech stack
+## Tech Stack
 
-- PostgreSQL - main database
-- Python (psycopg v3) - ingestion, quality check, and transformation scripts
-- DBeaver - database client
-- Docker + Airflow - orchestration (planned)
-- Azure - deployment (planned)
+- **PostgreSQL** - Main database (Bronze, Silver, Gold layers)
+- **Python (psycopg v3)** - Ingestion, quality check, and transformation scripts
+- **Apache Airflow** - Orchestration and scheduling
+- **Docker & Docker Compose** - Containerization and local environment setup
+- **Azure** - Cloud deployment (Documented)
+- **DBeaver** - Database client
 
 ## Architecture
 
 I use a Medallion Architecture: Bronze, Silver, Gold.
 
-- **Bronze**: raw data, exactly as it comes from the FPL API. Stored as 
-  JSON, with no changes. This keeps a safe, unmodified copy in case 
-  anything downstream needs to be reprocessed.
-- **Silver**: cleaned and typed data. Fields are extracted from the raw 
-  JSON, converted to the right types, and standardized (for example, 
-  player price is converted from a raw integer into a real decimal value).
-- **Gold**: final tables, ready for a dashboard. Some tables are 
-  denormalized on purpose, so dashboard queries stay fast and simple.
+- **Bronze**: Raw data, exactly as it comes from the FPL API. Stored as JSONB, with no changes. This keeps a safe, unmodified copy in case anything downstream needs to be reprocessed.
+- **Silver**: Cleaned and typed data. Fields are extracted from the raw JSON, converted to the right types, and standardized (for example, player price is converted from a raw integer into a real decimal value).
+- **Gold**: Final tables, ready for a dashboard. Some tables are denormalized on purpose, so dashboard queries stay fast and simple.
 
-A `pipeline_runs` table tracks every ingestion attempt, not just the final 
-result. If something fails, I can see exactly when it failed and why, on 
-the same day, instead of finding out later.
+A `pipeline_runs` table tracks every ingestion attempt, not just the final result. If something fails, I can see exactly when it failed and why, on the same day, instead of finding out later.
 
-## Database design
+## Database Design
 
-16 tables in total (6 Bronze, 5 Silver, 5 Gold). Every table and column 
-has a reason behind it, documented directly in the SQL files - why some 
-tables are denormalized and others are not, why some tables carry 
-traceability columns (`load_date`, `source_run_id`) and others don't.
+16 tables in total (6 Bronze, 5 Silver, 5 Gold). Every table and column has a reason behind it, documented directly in the SQL files—why some tables are denormalized and others are not, why some tables carry traceability columns (`load_date`, `source_run_id`) and others don't.
 
 The schema is built around 6 real questions a dashboard needs to answer:
 
@@ -51,105 +38,22 @@ The schema is built around 6 real questions a dashboard needs to answer:
 5. Compare a player's actual points with their expected points (xG/xA)
 6. Show which players are injured or doubtful right now
 
-## Bronze ingestion
+## Orchestration & Containerization
 
-Three ingestion scripts pull data from the FPL API into Bronze:
+I use **Apache Airflow** to orchestrate the pipeline and **Docker Compose** to run the entire stack locally.
 
-- `ingest_bootstrap_static.py` - players, teams, and element types 
-  (player positions), from the `bootstrap-static` endpoint
-- `ingest_fixtures.py` - all fixtures, from the `fixtures` endpoint
-- `ingest_event.py` - per-player gameweek stats, from `event/{gw}/live`, 
-  but only once a gameweek is fully finished (this table has a unique 
-  constraint per player per gameweek, so the same gameweek can't be 
-  pulled twice)
+- `Dockerfile`: I use the Python 3.11 version of the official Airflow image. I switched to 3.11 because the `psycopg` v3 library requires Python 3.9 or newer. Running `pip install` as the `airflow` user ensures packages are installed in the correct local site-packages directory.
+- `docker-compose.yml`: I use YAML anchors (`x-airflow-common`) to define the base configuration once, preventing repetition across the webserver, scheduler, and init containers.
+- `fpl_pipeline_dag.py`: The DAG enforces strict execution order. For example, `transform_teams` must finish before `transform_players` and `transform_fixtures` because of Foreign Key constraints in Silver.
+- **Database Initialization**: The `init-db.sh` script automatically creates the Airflow metadata database and executes all my Bronze, Silver, and Gold SQL files in the exact dependency order on the first startup.
 
-Every script tracks its own run in `pipeline_runs`, with a try/except and 
-rollback - if something fails partway through, nothing gets partially 
-saved. `snapshot_type` is calculated dynamically for players, teams, and 
-fixtures, based on real gameweek/deadline/match state, not hardcoded.
+## Cloud Deployment (Azure)
 
-Shared logic (database connection, and a reusable ingestion function for 
-JSON-based tables) lives in `src/db_utils.py`.
+While the pipeline runs locally via Docker Compose, I also documented the deployment strategy for Microsoft Azure to prove the architecture is production-ready.
 
-## Gate 1 - Bronze Data Quality Checks
+See the full step-by-step guide in [`docs/azure_deployment.md`](https://chat.deepseek.com/a/chat/s/docs/azure_deployment.md).
 
-Table constraints (NOT NULL, foreign keys) only protect the outer shape 
-of a row - they can't see inside the raw JSON itself, so a malformed or 
-incomplete API response could still insert without error. Gate 1 closes 
-that gap by checking what's actually inside the JSON.
-
-Results are recorded in a `quality_check_results` table - which table, 
-which rule, how many rows were checked, how many failed, and the actual 
-failed ids (not just a count, since a count alone isn't enough to act on).
-
-Gate 1 covers:
-- `bronze_players` - required fields exist inside raw_json, and status 
-  codes are one of the 5 known values (an unexpected code is flagged here 
-  rather than silently mapped to a default downstream)
-- `bronze_fixtures` - required fields always present, and score fields 
-  checked only on finished matches
-- `bronze_teams` - required fields always present
-- `bronze_event` - required stats exist inside the nested stats object
-
-`bronze_element_types` needs no check - it uses real typed columns, not 
-JSONB, so NOT NULL constraints already catch everything a check would.
-
-The check logic (`run_quality_check`) is shared and reusable, in 
-`src/quality_checks/quality_utils.py`.
-
-## Silver transformation
-
-Bronze data is cleaned, typed, and standardized into Silver tables:
-
-- `transform_players.py` - converts price, translates status codes into 
-  full words, picks the latest snapshot per player, excludes rows flagged 
-  by Gate 1
-- `transform_teams.py` - straight extraction and type casting
-- `transform_fixtures.py` - only finished matches, filtered before ranking 
-  snapshots (so a live snapshot can never outrank a finished one)
-- `transform_element_types.py` - a simple flattened copy, deduplicated 
-  since this table gets a new row inserted daily
-- `transform_player_gameweek_stats.py` - the most complex one: joins two 
-  Bronze sources (`bronze_event` for match stats, `bronze_players` for 
-  transfer counts, since that field only exists in one of the two)
-
-All Silver tables use `ON CONFLICT DO UPDATE`, making every script safe 
-to re-run. Rows that failed a Gate 1 check are excluded here - not 
-blocked entirely, not silently let through, just left out and logged, so 
-good data isn't held back by a few bad rows.
-
-## Gold population
-
-Silver data is joined and denormalized into the final, dashboard-ready 
-Gold layer:
-
-- `populate_gold_teams.py` / `populate_gold_players.py` - players 
-  denormalizes position and team name directly (a deliberate trade-off: 
-  cheap here since this table is small, keeps dashboard queries simple)
-- `populate_gold_fixture_results.py` - joins the teams table twice (once 
-  for home, once for away) to get both team names
-- `populate_gold_player_gameweek_performance.py` - kept normalized on 
-  purpose, since this table grows every gameweek and denormalizing would 
-  multiply storage cost for no real benefit
-- `populate_gold_player_price_history.py` - the one Gold table with no 
-  direct Silver source; it reads Bronze directly to detect real price 
-  changes (`cost_change_event != 0`), and only creates a row when a 
-  player's price actually moved that gameweek
-
-## Gate 2 - Silver to Gold reconciliation
-
-Gate 1 checks the raw source data. Gate 2 checks a narrower, more honest 
-thing: whether my own transformation logic silently lost rows during a 
-join. `check_gold_reconciliation.py` compares row counts between each 
-Silver table and its Gold target - they should always match, since none 
-of these transformations intentionally filter anything out.
-
-This check does not catch every possible bug - a mistake that keeps the 
-row count the same (like a home/away team swap) would not be caught here. 
-It only catches the "rows disappeared" class of bug, which is a real and 
-common failure mode for JOIN-based transformations.
-
-## Project structure
+## Project Structure
 
 ```text
 sql/
@@ -162,23 +66,55 @@ src/
 ├── db_utils.py             # shared database connection and shared ingestion logic
 ├── ingestion/              # scripts that pull data from the FPL API into Bronze
 ├── quality_checks/         # Gate 1 data quality checks (Bronze layer)
-└── transformation/         # Bronze to Silver to Gold logic (planned)
+└── transformation/         # Bronze to Silver to Gold logic
+
+dags/
+└── fpl_pipeline_dag.py     # Airflow DAG orchestrating the entire pipeline
 
 docs/
-└── schema-design.md        # my Gold schema design notes
+├── schema-design.md        # my Gold schema design notes
+└── azure_deployment.md     # Cloud deployment guide
+
+Dockerfile                  # Custom Airflow image with dependencies
+docker-compose.yml          # Local multi-container orchestration
 ```
 
+## How to Run Locally
 
-## Current progress
+### Prerequisites
 
-- [x] Full database design (Bronze, Silver, Gold - 16 tables)
-- [x] Bronze ingestion for all three FPL API endpoints
-- [x] Dynamic snapshot_type logic
-- [x] Reusable, DRY ingestion functions shared across scripts
-- [x] Gate 1 quality checks for all applicable Bronze tables
-- [x] Silver transformation for all 5 tables
-- [x] Gold population for all 5 tables
-- [x] Gate 2 row-count reconciliation check
-- [ ] Docker + Docker Compose
-- [ ] Airflow orchestration
-- [ ] Deployment on Azure
+Docker Desktop installed and running.
+
+### Steps
+
+1. Clone the repository.
+
+2. Create your environment file:
+
+```bash
+cp .env.example .env
+```
+
+3. Start the containers:
+
+```bash
+docker-compose up -d --build
+```
+
+4. Wait for Airflow to initialize. Then, access the Airflow UI at http://localhost:8080 (Username: admin, Password: admin).
+
+5. Trigger the `fpl_data_pipeline` DAG to run the entire pipeline.
+
+## Current Progress
+
+- ☑ Full database design (Bronze, Silver, Gold - 16 tables)
+- ☑ Bronze ingestion for all three FPL API endpoints
+- ☑ Dynamic snapshot_type logic
+- ☑ Reusable, DRY ingestion functions shared across scripts
+- ☑ Gate 1 quality checks for all applicable Bronze tables
+- ☑ Silver transformation for all 5 tables
+- ☑ Gold population for all 5 tables
+- ☑ Gate 2 row-count reconciliation check
+- ☑ Docker + Docker Compose
+- ☑ Airflow orchestration
+- ☑ Azure deployment documentation
