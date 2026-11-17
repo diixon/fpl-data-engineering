@@ -27,7 +27,7 @@ A `pipeline_runs` table tracks every ingestion attempt, not just the final resul
 
 ## Database Design
 
-16 tables in total (6 Bronze, 5 Silver, 5 Gold). Every table and column has a reason behind it, documented directly in the SQL files—why some tables are denormalized and others are not, why some tables carry traceability columns (`load_date`, `source_run_id`) and others don't.
+17 tables in total: 6 Bronze (5 data tables + `pipeline_runs`), 5 Silver, 5 Gold, and `quality_check_results`. Every table and column has a reason behind it, documented directly in the SQL files—why some tables are denormalized and others are not, why some tables carry traceability columns (`load_date`, `source_run_id`) and others don't.
 
 The schema is built around 6 real questions a dashboard needs to answer:
 
@@ -38,25 +38,41 @@ The schema is built around 6 real questions a dashboard needs to answer:
 5. Compare a player's actual points with their expected points (xG/xA)
 6. Show which players are injured or doubtful right now
 
+## Data Quality
+
+Two checkpoints ("gates") protect the data, and every result is saved in the `quality_check_results` table (including the list of failed IDs as JSONB, not just a count):
+
+- **Gate 1 (Bronze)**: table constraints cannot look inside raw JSON, so Python checks run on the JSONB itself (for example: required keys missing, invalid player status, finished match without scores). The Silver transformation then **skips** the flagged rows instead of failing the whole run.
+- **Gate 2 (Silver to Gold)**: compares row counts between Silver and Gold, so rows that silently disappear (for example from a bad JOIN) are caught. It checks counts only - it does not catch wrong values.
+
+```mermaid
+flowchart LR
+    API[FPL API] --> ING[Ingestion] --> B[(Bronze)]
+    B --> G1{{Gate 1}} --> S[(Silver)] --> G[(Gold)] --> G2{{Gate 2}}
+```
+
 ## Orchestration & Containerization
 
 I use **Apache Airflow** to orchestrate the pipeline and **Docker Compose** to run the entire stack locally.
 
 - `Dockerfile`: I use the Python 3.11 version of the official Airflow image. I switched to 3.11 because the `psycopg` v3 library requires Python 3.9 or newer. Running `pip install` as the `airflow` user ensures packages are installed in the correct local site-packages directory.
 - `docker-compose.yml`: I use YAML anchors (`x-airflow-common`) to define the base configuration once, preventing repetition across the webserver, scheduler, and init containers.
-- `fpl_pipeline_dag.py`: The DAG enforces strict execution order. For example, `transform_teams` must finish before `transform_players` and `transform_fixtures` because of Foreign Key constraints in Silver.
+- `fpl_pipeline_dag.py`: The DAG enforces strict execution order, because of Foreign Key constraints. For example, `transform_teams` must finish before `transform_players` and `transform_fixtures` (Silver), and `populate_gold_players` must finish before `populate_gold_player_gameweek_performance` and `populate_gold_player_price_history` (Gold). Only one DAG run can be active at a time (`max_active_runs=1`).
+- **Failures are visible**: an ingestion script that fails records the error in `pipeline_runs` **and** exits with code 1, so the Airflow task turns red. Gate 2 also fails the task when Gold has fewer rows than Silver.
 - **Database Initialization**: The `init-db.sh` script automatically creates the Airflow metadata database and executes all my Bronze, Silver, and Gold SQL files in the exact dependency order on the first startup.
 
 ## Cloud Deployment (Azure)
 
-While the pipeline runs locally via Docker Compose, I also documented the deployment strategy for Microsoft Azure to prove the architecture is production-ready.
+The pipeline runs locally via Docker Compose. I also wrote the deployment plan for Microsoft Azure. **It is documented, not deployed yet.**
 
-See the full step-by-step guide in [`docs/azure_deployment.md`](https://chat.deepseek.com/a/chat/s/docs/azure_deployment.md).
+See the full step-by-step guide in [`docs/azure_deployment.md`](docs/azure_deployment.md).
 
 ## Project Structure
 
 ```text
 sql/
+├── gold/dashboard_queries.sql  # one tested query for each of the 6 dashboard questions
+├── init-db.sh              # runs all SQL files in dependency order on first startup
 ├── bronze/                 # Bronze layer table definitions
 ├── silver/                 # Silver layer table definitions
 ├── gold/                   # Gold layer table definitions
@@ -68,6 +84,8 @@ src/
 ├── quality_checks/         # Gate 1 data quality checks (Bronze layer)
 └── transformation/         # Bronze to Silver to Gold logic
 
+tests/                      # pytest tests (run on temporary schemas built from my real SQL files)
+
 dags/
 └── fpl_pipeline_dag.py     # Airflow DAG orchestrating the entire pipeline
 
@@ -77,6 +95,9 @@ docs/
 
 Dockerfile                  # Custom Airflow image with dependencies
 docker-compose.yml          # Local multi-container orchestration
+.env.example                # Template for local settings (copy to .env)
+.gitattributes              # Keeps LF line endings for scripts that run in Linux containers
+pytest.ini / requirements-dev.txt   # test setup
 ```
 
 ## How to Run Locally
@@ -89,7 +110,7 @@ Docker Desktop installed and running.
 
 1. Clone the repository.
 
-2. Create your environment file:
+2. Create your environment file (local development values, never commit `.env`):
 
 ```bash
 cp .env.example .env
@@ -103,7 +124,43 @@ docker-compose up -d --build
 
 4. Wait for Airflow to initialize. Then, access the Airflow UI at http://localhost:8080 (Username: admin, Password: admin).
 
-5. Trigger the `fpl_data_pipeline` DAG to run the entire pipeline.
+5. In the Airflow UI, turn the `fpl_data_pipeline` DAG **on** (the toggle on the left - DAGs start paused), then trigger it to run the entire pipeline.
+
+To stop everything: `docker-compose down`. To also delete the database data and re-run the SQL init scripts from scratch: `docker-compose down -v`.
+
+### Connect with DBeaver
+
+| Setting | Value |
+|---|---|
+| Host | `localhost` |
+| Port | `5432` (or `POSTGRES_HOST_PORT` from `.env`) |
+| Database | `fpl_db` |
+| User / Password | `DB_USER` / `DB_PASSWORD` from `.env` |
+
+Running a script directly from my machine (outside Docker), for example `python -m src.transformation.transform_players`, needs `DB_HOST=localhost` in `.env`.
+
+## Tests
+
+The tests run against a real PostgreSQL, but inside a temporary schema that is created from my own SQL files and dropped afterwards, so they never touch my real data. They check things like: every player flagged by Gate 1 is excluded (not only the first), Gate 1 judges only the newest snapshot, a failed ingestion rolls back and is recorded, and Gold loads do not crash on foreign keys.
+
+```bash
+pip install -r requirements-dev.txt
+docker-compose up -d postgres      # needs DB_HOST=localhost in .env
+pytest
+```
+
+If the database is not reachable, the database tests are skipped instead of failing.
+
+## Known Limitations
+
+I list these on purpose - they are decisions I understand, not surprises.
+
+- `transfers_in_event` in Silver is the **latest** value from Bronze, not the value at that exact gameweek. It is correct for "most transferred-in this gameweek", but may not match the API for older gameweeks.
+- FPL's own team fields (`points`, `played`, `position`, ...) often stay at 0 - this looks like a quirk on FPL's side. None of the 6 dashboard questions use them.
+- `player_price_history` is built from the latest Bronze snapshot, and assumes `cost_change_event` resets every gameweek (a reasonable assumption from FPL's naming, not confirmed by official documentation).
+- Gate 2 compares row counts only, so it cannot catch wrong values, and it only notices Gold having *fewer* rows than Silver.
+- Gate 1 judges the newest snapshot of each player, team and fixture (that is what Silver uses). For `bronze_event` a flagged player is excluded from all gameweeks, not only the broken one.
+- Bronze keeps a new full snapshot every day, so it grows continuously. I have not measured the growth yet (`pg_total_relation_size('bronze_players')` after a few weeks will tell), and there is no cleanup of old snapshots.
 
 ## Current Progress
 
@@ -117,4 +174,6 @@ docker-compose up -d --build
 - ☑ Gate 2 row-count reconciliation check
 - ☑ Docker + Docker Compose
 - ☑ Airflow orchestration
-- ☑ Azure deployment documentation
+- ☑ pytest tests for Gate 1, Silver, Gold, ingestion
+- ☑ Dashboard queries for the 6 questions
+- ☑ Azure deployment documentation (not deployed)

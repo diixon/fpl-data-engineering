@@ -1,82 +1,75 @@
 # Azure Deployment Guide
 
+> **Status: documented, not deployed.** This guide is the plan I would follow. I have not run it on Azure yet, so treat the exact portal labels and prices as things to check, not as tested facts.
+
 ## Why Azure?
 
-I chose Azure for this project because it offers a robust, enterprise-grade ecosystem that aligns with standard Data Engineering practices. While the pipeline runs locally via Docker Compose, deploying it to the cloud proves that the architecture is production-ready.
+I chose Azure because it is a common platform in Data Engineering jobs, and because deploying the pipeline there shows the architecture is not tied to my laptop. Locally everything runs with Docker Compose; in the cloud I split it into two managed pieces:
 
-## Architecture Overview
+1. **Azure Database for PostgreSQL (Flexible Server)** - holds my FPL data (Bronze, Silver, Gold). Backups and patching are handled by Azure.
+2. **A Linux Virtual Machine** - runs the Docker containers (Airflow webserver and scheduler). I chose a VM over Azure Container Instances because Airflow needs persistent storage for logs and DAGs, which is simpler on a VM.
 
-For the cloud deployment, I split the architecture into two managed services:
+> **Cost warning:** both pieces are paid resources, not free ones. Before creating anything I check the Azure pricing calculator and whether my account has free credits or a student offer (offers change, so I read the current terms). I also stop the VM when I am not using it, and delete the whole resource group when the project is finished.
 
-1. **Azure Database for PostgreSQL**: A managed database service. I chose this over running Postgres in a container because it handles backups, patching, and high availability automatically.
-2. **Azure Virtual Machine (VM)**: A Linux VM to host the Docker containers (Airflow Webserver and Scheduler). I chose a VM over Azure Container Instances (ACI) because Airflow needs persistent storage for logs and DAGs, which is easier to manage on a VM.
+## 1. Database (Azure PostgreSQL Flexible Server)
 
-## 1. Database Deployment (Azure PostgreSQL)
+1. In the Azure Portal, create an **Azure Database for PostgreSQL Flexible Server**.
+2. Choose a server name (for example `fpl-postgres-server`), an admin username and a strong password. I save them safely - they replace the local credentials in `.env`.
+3. Compute: the smallest **Burstable** size is enough for this data volume (~600 players, ~380 fixtures, one new snapshot per day).
+4. Networking: **Public access**, with firewall rules for (a) my own IP, so DBeaver can connect, and (b) the VM's public IP, added after I create the VM in step 2. Azure requires SSL by default; the Python driver negotiates it automatically.
+5. The server starts with only the default `postgres` database. I create my own database named `fpl_db` (DBeaver: right click, Create database).
+6. I create the tables by running my SQL files **in this exact order** (the same order `sql/init-db.sh` uses locally). I do not run `init-db.sh` itself, because it also creates the Airflow metadata database, which stays on the VM:
 
-I use the Flexible Server option for better cost control and configuration.
+   1. `sql/bronze/create_pipeline_runs.sql`
+   2. `sql/bronze/create_bronze_tables.sql`
+   3. `sql/silver/create_silver_tables.sql`
+   4. `sql/silver/add_silver_constraints.sql`
+   5. `sql/gold/create_gold_tables.sql`
+   6. `sql/quality_checks/create_quality_check_results.sql`
 
-1. Go to the Azure Portal and search for **Azure Database for PostgreSQL Flexible Server**.
-2. Click **Create**.
-3. Set the **Server name** (e.g., `fpl-postgres-server`).
-4. Set **Admin username** and **Password** (I save these securely, as they replace the local `.env` credentials).
-5. Under **Compute + Storage**, I choose the **Burstable, B1ms** tier. This is the cheapest tier and is more than enough for this project's data volume (\~600 players, \~380 fixtures).
-6. Under **Networking**, I enable **Public access** and add my current IP address to the firewall rules. This allows me to connect via DBeaver locally and allows the Azure VM to connect later.
-7. Once deployed, I connect to the database using DBeaver and run the SQL scripts from my `sql/` folder to create the tables.
+## 2. Airflow (Azure Virtual Machine)
 
-## 2. Airflow Deployment (Azure Virtual Machine)
+1. Create a **Linux VM**: Ubuntu Server 22.04 LTS, a size with **at least 4 GB RAM** (Airflow with LocalExecutor is slow or unstable below that), SSH key login.
+2. Network security rules: allow SSH (22) **only from my IP**, and the Airflow UI (8080) **only from my IP**. Port 8080 open to the whole internet would expose an Airflow login to everyone.
+3. Add the VM's public IP to the PostgreSQL firewall rules (step 1.4).
+4. Connect and install Docker (the official script installs Docker Engine and the `docker compose` plugin):
 
-To run Airflow 24/7 without relying on my local machine, I deploy it on a Linux VM.
-
-1. In the Azure Portal, I create a **Virtual Machine**.
-2. Image: **Ubuntu Server 22.04 LTS**.
-3. Size: **Standard_B2s** (2 vCPUs, 4GB RAM). Airflow's LocalExecutor needs at least 4GB of RAM to run smoothly.
-4. I download the SSH key or set a password.
-5. I connect to the VM via SSH:&#x20;
    ```bash
-   ssh azureuser@<your-vm-public-ip>
-
+   ssh azureuser@<vm-public-ip>
+   curl -fsSL https://get.docker.com | sudo sh
+   sudo usermod -aG docker $USER
+   newgrp docker
    ```
 
-I install Docker and Docker Compose on the VM:
+5. Clone the repository and create `.env`:
 
-
-
-bash sudo apt-get update sudo apt-get install docker.io docker-compose -y sudo usermod -aG docker $USER newgrp docker I clone my GitHub repository to the VM:
-
-
-
-bash git clone [https://github.com/diixon/fpl-data-engineering.git](https://github.com/diixon/fpl-data-engineering.git) cd fpl-data-engineering I update the .env file in the VM. I change DB_HOST to point to the Azure PostgreSQL server address. I change DB_USER and DB_PASSWORD to the Azure DB credentials.
-
-
-
-I run the pipeline:
-
-
-
-bash docker-compose up -d I access the Airflow UI at http\://:8080 (username: admin, password: admin).
-
-
-
-text
-
----
-
-### Your Exact Steps to Execute Now:
-
-1. **Save the Files**: Copy the content above and save them exactly as named in your project folder. Make sure `init-db.sh` is saved with **LF line endings** (I recommend using VS Code, or use the PowerShell command I gave you earlier).
-2. **Clean and Rebuild**: Open your Command Prompt in the project folder and run these commands in order:&#x20;
-   ```cmd
-   docker-compose down -v
-
+   ```bash
+   git clone https://github.com/diixon/fpl-data-engineering.git
+   cd fpl-data-engineering
+   cp .env.example .env
    ```
 
-   (This deletes the old, broken database volume).
+   In `.env`, set `DB_USER`, `DB_PASSWORD` and `DB_NAME` to the Azure database values, and add:
 
+   ```text
+   DOCKER_DB_HOST=<server-name>.postgres.database.azure.com
+   ```
 
+   `DOCKER_DB_HOST` is the address the containers use for my FPL data (locally it defaults to the `postgres` container). The local Postgres container still starts on the VM, but it only holds Airflow's own metadata there.
 
-	```cmd
-	docker-compose up -d --build
-	
-	```
-	
-	(This builds the new image and starts the containers fresh).
+6. Start everything:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+7. Open `http://<vm-public-ip>:8080`, log in with `admin` / `admin`, and **change the admin password immediately** (the default is only safe on my own laptop). Then turn the `fpl_data_pipeline` DAG on and trigger it.
+
+## 3. Check that it works
+
+- In DBeaver (connected to the Azure server), `pipeline_runs` should show rows with `status = 'success'`, and `quality_check_results` should have rows from Gate 1 and Gate 2.
+- The six queries in `sql/gold/dashboard_queries.sql` should return data once the DAG has finished.
+
+## 4. Cleaning up
+
+When I am done: stop (deallocate) the VM, or delete the whole resource group, so nothing keeps costing money.
