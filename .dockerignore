@@ -1,0 +1,5 @@
+# The Docker build only needs requirements.txt (the Dockerfile COPYs just that file).
+# Everything else is mounted as volumes at runtime, so I keep it OUT of the build
+# context: faster builds, and .env (secrets) is never sent to the Docker daemon.
+*
+!requirements.txt

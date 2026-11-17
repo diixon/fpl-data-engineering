@@ -74,6 +74,5 @@ def transform_element_types(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    transform_element_types(conn)
-    conn.close()
+    with get_connection() as conn:
+        transform_element_types(conn)

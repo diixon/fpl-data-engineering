@@ -32,6 +32,5 @@ def populate_gold_teams(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    populate_gold_teams(conn)
-    conn.close()
+    with get_connection() as conn:
+        populate_gold_teams(conn)

@@ -65,6 +65,5 @@ def populate_gold_fixture_results(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    populate_gold_fixture_results(conn)
-    conn.close()
+    with get_connection() as conn:
+        populate_gold_fixture_results(conn)

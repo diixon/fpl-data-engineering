@@ -1,4 +1,4 @@
-from src.db_utils import get_connection
+from src.db_utils import get_connection, fetch_json, latest_failed_ids_sql
 
 
 def get_current_gameweek(events):
@@ -12,6 +12,9 @@ def get_current_gameweek(events):
     for event in events:
         if event["is_current"]:
             return event["id"]
+    # Without this, the function silently returned None and the INSERT
+    # later failed with a confusing NULL-in-primary-key error.
+    raise ValueError("No gameweek has is_current = true in the FPL events data.")
 
 
 def populate_gold_player_price_history(conn, gameweek):
@@ -36,10 +39,17 @@ def populate_gold_player_price_history(conn, gameweek):
     old_price is not stored, since it's always derivable: new_price -
     price_change_amount reconstructs it, so storing it separately would
     be redundant.
+
+    Two protections added after testing: (1) JOIN players - this table has
+    a foreign key to Gold players, and a player that Silver left out
+    (Gate 1) is not in Gold players, so without the JOIN one such player
+    crashed the whole load. (2) Gate 1 required_keys_missing ids are
+    skipped, because this query reads Bronze directly and would otherwise
+    hit a NOT NULL error on a missing now_cost.
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO player_price_history (
                 player_id,
                 gameweek,
@@ -61,8 +71,13 @@ def populate_gold_player_price_history(conn, gameweek):
                     ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY load_date DESC) AS rn
                 FROM bronze_players
             ) t
+            JOIN players p
+              ON p.player_id = t.player_id
             WHERE t.rn = 1
               AND (t.raw_json->>'cost_change_event')::INT != 0
+              AND t.player_id NOT IN (
+                  {latest_failed_ids_sql('bronze_players', 'required_keys_missing')}
+              )
             ON CONFLICT (player_id, gameweek) DO UPDATE SET
                 new_price           = EXCLUDED.new_price,
                 price_change_amount = EXCLUDED.price_change_amount,
@@ -78,12 +93,8 @@ def populate_gold_player_price_history(conn, gameweek):
 
 
 if __name__ == "__main__":
-    import requests
-
-    response = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-    events = response.json()["events"]
+    events = fetch_json("https://fantasy.premierleague.com/api/bootstrap-static/")["events"]
     gw = get_current_gameweek(events)
 
-    conn = get_connection()
-    populate_gold_player_price_history(conn, gw)
-    conn.close()
+    with get_connection() as conn:
+        populate_gold_player_price_history(conn, gw)

@@ -1,5 +1,5 @@
 from src.db_utils import get_connection
-from src.quality_checks.quality_utils import run_quality_check
+from src.quality_checks.quality_utils import run_quality_check, latest_snapshot_sql
 
 
 def check_bronze_teams(conn):
@@ -14,10 +14,10 @@ def check_bronze_teams(conn):
         conn,
         table_name="bronze_teams",
         rule_name="required_keys_missing",
-        count_query="SELECT COUNT(*) FROM bronze_teams",
-        failed_ids_query="""
+        count_query=f"SELECT COUNT(*) FROM {latest_snapshot_sql('bronze_teams', 'team_id')}",
+        failed_ids_query=f"""
             SELECT team_id
-            FROM bronze_teams
+            FROM {latest_snapshot_sql('bronze_teams', 'team_id')}
             WHERE raw_json->>'id' IS NULL
                OR raw_json->>'name' IS NULL
                OR raw_json->>'short_name' IS NULL
@@ -32,6 +32,5 @@ def check_bronze_teams(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    check_bronze_teams(conn)
-    conn.close()
+    with get_connection() as conn:
+        check_bronze_teams(conn)

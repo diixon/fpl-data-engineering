@@ -1,5 +1,6 @@
+import sys
 from src.db_utils import get_connection
-from src.quality_checks.quality_utils import run_quality_check
+from src.quality_checks.quality_utils import record_check_result
 
 
 def check_gold_reconciliation(conn):
@@ -38,6 +39,8 @@ def check_gold_reconciliation(conn):
         ("silver_player_gameweek_stats", "player_gameweek_performance"),
     ]
 
+    mismatches = []
+
     for silver_table, gold_table in reconciliation_pairs:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {silver_table}")
@@ -48,29 +51,37 @@ def check_gold_reconciliation(conn):
 
         rows_failed = max(silver_count - gold_count, 0)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO quality_check_results
-                    (table_name, rule_name, checked_at, rows_checked,
-                     rows_failed, failed_ids)
-                VALUES
-                    (%s, %s, NOW(), %s, %s, NULL)
-                """,
-                (
-                    gold_table,
-                    "silver_gold_row_count_mismatch",
-                    silver_count,
-                    rows_failed
-                )
-            )
-        conn.commit()
+        record_check_result(
+            conn,
+            table_name=gold_table,
+            rule_name="silver_gold_row_count_mismatch",
+            rows_checked=silver_count,
+            rows_failed=rows_failed,
+        )
+
+        if rows_failed > 0:
+            mismatches.append(gold_table)
 
         print(f"[{gold_table}] Silver: {silver_count}, Gold: {gold_count} — "
               f"{'OK' if rows_failed == 0 else f'{rows_failed} rows missing'}")
 
+    return mismatches
+
+
+def main():
+    """
+    Returns the exit code. A gate that only prints is not a gate: if rows
+    are missing, the script exits with 1, so the Airflow task turns red and
+    I see the problem the same day. Before, this check recorded the
+    mismatch in quality_check_results but the task stayed green.
+    """
+    with get_connection() as conn:
+        mismatches = check_gold_reconciliation(conn)
+    if mismatches:
+        print(f"Gate 2 FAILED - rows missing in: {', '.join(mismatches)}")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    conn = get_connection()
-    check_gold_reconciliation(conn)
-    conn.close()
+    sys.exit(main())

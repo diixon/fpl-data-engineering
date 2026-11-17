@@ -1,4 +1,4 @@
-from src.db_utils import get_connection
+from src.db_utils import get_connection, latest_failed_ids_sql
 
 
 def transform_fixtures(conn):
@@ -21,7 +21,7 @@ def transform_fixtures(conn):
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO silver_fixtures (
                 fixture_id, gameweek, kickoff_time,
                 team_h, team_a, team_h_score, team_a_score,
@@ -49,23 +49,9 @@ def transform_fixtures(conn):
             ) t
             WHERE t.rn = 1
               AND t.fixture_id NOT IN (
-                  (
-                      SELECT jsonb_array_elements(failed_ids)::TEXT::INT
-                      FROM quality_check_results
-                      WHERE table_name = 'bronze_fixtures'
-                        AND rule_name = 'required_keys_missing'
-                      ORDER BY checked_at DESC
-                      LIMIT 1
-                  )
+                  {latest_failed_ids_sql('bronze_fixtures', 'required_keys_missing')}
                   UNION
-                  (
-                      SELECT jsonb_array_elements(failed_ids)::TEXT::INT
-                      FROM quality_check_results
-                      WHERE table_name = 'bronze_fixtures'
-                        AND rule_name = 'finished_match_missing_scores'
-                      ORDER BY checked_at DESC
-                      LIMIT 1
-                  )
+                  {latest_failed_ids_sql('bronze_fixtures', 'finished_match_missing_scores')}
               )
             ON CONFLICT (fixture_id) DO UPDATE SET
                 gameweek            = EXCLUDED.gameweek,
@@ -87,6 +73,5 @@ def transform_fixtures(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    transform_fixtures(conn)
-    conn.close()
+    with get_connection() as conn:
+        transform_fixtures(conn)

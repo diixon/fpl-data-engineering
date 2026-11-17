@@ -82,7 +82,7 @@ constraint fk_pph_p_id foreign key (player_id) references players (player_id)
 create table fixture_results(
 fixture_id int primary key,
 gameweek int not null,
-kickoff_time timestamp not null,
+kickoff_time timestamptz not null,
 team_h_name text not null,
 team_a_name text not null,
 team_h_score int not null,

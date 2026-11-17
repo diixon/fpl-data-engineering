@@ -1,4 +1,4 @@
-from src.db_utils import get_connection
+from src.db_utils import get_connection, latest_failed_ids_sql
 
 
 def transform_player_gameweek_stats(conn):
@@ -34,9 +34,13 @@ def transform_player_gameweek_stats(conn):
       - bronze_players / required_keys_missing   (missing transfers_in_event
                                                   would break the NOT NULL)
 
-    invalid_status_value is NOT used here on purpose - that rule is about
-    injury_status, which this table does not store. Only rules that affect
-    a column this table actually has are used.
+    invalid_status_value is NOT used here directly - that rule is about
+    injury_status, which this table does not store. But a player excluded
+    from silver_players by that rule must not get stats rows either:
+    silver_player_gameweek_stats has a foreign key to silver_players, so
+    the old version crashed the whole transformation with a
+    ForeignKeyViolation as soon as one such player existed. The JOIN to
+    silver_players below keeps only players that really made it to Silver.
 
     silver_player_gameweek_stats is APPEND-ONLY (each gameweek is a
     permanent fact, unlike players/teams). ON CONFLICT DO UPDATE makes it
@@ -44,7 +48,7 @@ def transform_player_gameweek_stats(conn):
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO silver_player_gameweek_stats (
                 player_id,
                 gameweek,
@@ -86,24 +90,12 @@ def transform_player_gameweek_stats(conn):
             ) lbp
               ON lbp.player_id = be.player_id
              AND lbp.rn = 1
+            JOIN silver_players sp
+              ON sp.player_id = be.player_id
             WHERE be.player_id NOT IN (
-                (
-                    SELECT (jsonb_array_elements(failed_ids))::TEXT::INT
-                    FROM quality_check_results
-                    WHERE table_name = 'bronze_event'
-                      AND rule_name = 'required_stats_missing'
-                    ORDER BY checked_at DESC
-                    LIMIT 1
-                )
+                {latest_failed_ids_sql('bronze_event', 'required_stats_missing')}
                 UNION
-                (
-                    SELECT (jsonb_array_elements(failed_ids))::TEXT::INT
-                    FROM quality_check_results
-                    WHERE table_name = 'bronze_players'
-                      AND rule_name = 'required_keys_missing'
-                    ORDER BY checked_at DESC
-                    LIMIT 1
-                )
+                {latest_failed_ids_sql('bronze_players', 'required_keys_missing')}
             )
             ON CONFLICT (player_id, gameweek) DO UPDATE SET
                 transfers_in_event = EXCLUDED.transfers_in_event,
@@ -127,6 +119,5 @@ def transform_player_gameweek_stats(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    transform_player_gameweek_stats(conn)
-    conn.close()
+    with get_connection() as conn:
+        transform_player_gameweek_stats(conn)

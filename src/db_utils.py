@@ -9,6 +9,7 @@ and import it everywhere else, instead of repeating the same code.
 
 import os
 import psycopg
+import requests
 from dotenv import load_dotenv
 from psycopg.types.json import Jsonb
 from datetime import datetime, timezone
@@ -23,12 +24,101 @@ def get_connection():
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"]
     )
-    print(f"Connected successfully!")
+    print("Connected successfully!")
     return conn
 
 
+def fetch_json(url):
+    """
+    One place for every FPL API call. Two things the plain requests.get
+    did not do: timeout (without it, a stuck connection can hang the
+    Airflow task forever) and raise_for_status (without it, an HTTP 500
+    or 403 page would be parsed as if it were data and fail later with a
+    confusing error far from the real cause).
+    """
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def start_pipeline_run(conn, source_name):
+    """Creates the pipeline_runs row for one ingestion attempt and returns its run_id."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into pipeline_runs (source_name, run_timestamp, status, rows_loaded) "
+            "values (%s, %s, %s, %s) returning run_id",
+            (source_name, datetime.now(), "in_progress", 0)
+        )
+        run_id = cur.fetchone()[0]
+    conn.commit()
+    print(f"Pipeline run created with run_id: {run_id}")
+    return run_id
+
+
+def mark_run_success(cur, run_id, rows_loaded):
+    """
+    Takes a CURSOR (not a connection) and does not commit on purpose: the
+    caller commits once, so the inserted rows and the 'success' status are
+    saved together or not at all.
+    """
+    cur.execute(
+        "update pipeline_runs set status = %s, rows_loaded = %s where run_id = %s",
+        ("success", rows_loaded, run_id)
+    )
+
+
+def mark_run_failed(conn, run_id, error):
+    """
+    rollback undoes all partial inserts - no half success state. Then the
+    real error is saved in pipeline_runs, so I can see failures the same
+    day, not find out later.
+    """
+    conn.rollback()
+    print(f"Error occurred: {error}")
+    with conn.cursor() as cur:
+        cur.execute(
+            "update pipeline_runs set status = %s, error_message = %s where run_id = %s",
+            ("failed", str(error), run_id)
+        )
+    conn.commit()
+
+
+def latest_failed_ids_sql(table_name, rule_name):
+    """
+    Returns a SQL snippet that gives back the failed IDs from the LATEST
+    Gate 1 check of one rule, one ID per row. The transform scripts put it
+    inside "NOT IN (...)" to skip the rows Gate 1 flagged.
+
+    Why this is a function: the same exclusion logic is needed in several
+    transform scripts, so I write it once here (DRY).
+
+    Why the nested subquery matters: the first version used
+        SELECT jsonb_array_elements(failed_ids) ... ORDER BY checked_at DESC LIMIT 1
+    but in Postgres the set-returning function expands the array into rows
+    BEFORE ORDER BY / LIMIT run - so LIMIT 1 kept only ONE failed ID, not
+    the whole list of the latest check. The inner query picks the latest
+    check row first (LIMIT 1 on whole rows), and only then the outer query
+    expands its failed_ids array. I tested both versions: with 5 failed IDs
+    the old one excluded 1, this one excludes all 5.
+
+    table_name and rule_name are fixed strings written in my own code
+    (never user input), so putting them in the SQL text is safe here.
+    """
+    return f"""
+        SELECT jsonb_array_elements_text(latest.failed_ids)::INT
+        FROM (
+            SELECT failed_ids
+            FROM quality_check_results
+            WHERE table_name = '{table_name}'
+              AND rule_name = '{rule_name}'
+            ORDER BY checked_at DESC
+            LIMIT 1
+        ) latest
+    """
+
+
 def ingest_jsonb_entity(conn, entity_name, singular_name, entity_data,
-                         source_name, get_snapshot_type):
+                         source_name, get_snapshot_type, raise_on_error=False):
     """
     I use this one function for players, teams, and fixtures - they all
     have the same shape (raw JSON stored as-is). I do NOT use it for
@@ -44,45 +134,49 @@ def ingest_jsonb_entity(conn, entity_name, singular_name, entity_data,
     a small function that just returns that one fixed value. For fixtures,
     every fixture is different (some finished, some not), so I pass a
     function that actually looks at each fixture and decides.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            "insert into pipeline_runs (source_name, run_timestamp, status, rows_loaded) " \
-            "values (%s, %s, %s, %s) returning run_id",
-            (source_name, datetime.now(), "in_progress", 0)
-        )
-        run_id = cur.fetchone()[0]
-        conn.commit()
-    print(f"Pipeline run created with run_id: {run_id}")
 
-    with conn.cursor() as cur:
-        try:
-            # Jsonb() wraps each raw dict so psycopg saves it correctly into
-            # the raw_json jsonb column. The id is taken out separately for
-            # the dedicated {singular_name}_id column.
-            for item in entity_data:
-                cur.execute(
-                    f"insert into bronze_{entity_name} ({singular_name}_id, raw_json, load_date, "
-                    f"snapshot_type, run_id) values (%s, %s, %s, %s, %s)",
-                    (item["id"], Jsonb(item), datetime.now(), get_snapshot_type(item), run_id)
-                )
-            cur.execute(
-                "update pipeline_runs set status = %s, rows_loaded = %s where run_id = %s",
-                ("success", len(entity_data), run_id)
+    Return value / raise_on_error: the function returns True on success and
+    False on failure, so the caller can know what happened. By default a
+    failure is recorded in pipeline_runs and NOT raised (keeps the isolation
+    above). Under Airflow a task that swallows its error shows up green, so
+    the ingestion scripts check the return value and exit with code 1.
+    """
+    run_id = start_pipeline_run(conn, source_name)
+
+    try:
+        # One load time for the whole run (instead of one per row), so every
+        # row from the same run is easy to group by load_date.
+        load_time = datetime.now()
+
+        # Jsonb() wraps each raw dict so psycopg saves it correctly into
+        # the raw_json jsonb column. The id is taken out separately for
+        # the dedicated {singular_name}_id column. I build the full list
+        # first, then insert it with executemany - one batch instead of one
+        # round trip per row (same lesson as the SuperStore project).
+        rows = [
+            (item["id"], Jsonb(item), load_time, get_snapshot_type(item), run_id)
+            for item in entity_data
+        ]
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"insert into bronze_{entity_name} ({singular_name}_id, raw_json, load_date, "
+                f"snapshot_type, run_id) values (%s, %s, %s, %s, %s)",
+                rows
             )
-            conn.commit()
-            print(f"Inserted {len(entity_data)} {entity_name} into the database.")
-        except Exception as e:
-            # rollback undoes all partial inserts from this loop - no half
-            # success state. Then I update pipeline_runs with the real error,
-            # so I can see failures the same day, not find out later.
-            conn.rollback()
-            print(f"Error occurred: {e}")
-            cur.execute(
-                "update pipeline_runs set status = %s, error_message = %s where run_id = %s",
-                ("failed", str(e), run_id)
-            )
-            conn.commit()
+            mark_run_success(cur, run_id, len(rows))
+        conn.commit()
+        print(f"Inserted {len(rows)} {entity_name} into the database.")
+        return True
+    except Exception as e:
+        mark_run_failed(conn, run_id, e)
+        if raise_on_error:
+            raise
+        return False
+
+
+def _parse_deadline(event):
+    """FPL sends deadlines like '2026-08-15T17:30:00Z'; Python needs '+00:00' instead of 'Z'."""
+    return datetime.fromisoformat(event["deadline_time"].replace("Z", "+00:00"))
 
 
 def determine_snapshot_type(events):
@@ -98,34 +192,28 @@ def determine_snapshot_type(events):
     stays the same every time. This matters: if one branch returned just
     one value, unpacking it into two variables would silently break in a
     confusing way (I actually tested this and saw it happen with strings).
+
+    If no branch matches (for example before the season starts, when no
+    deadline is in the past yet), the old version fell off the end and
+    returned None, and the caller's "label, gw = ..." crashed with
+    "cannot unpack non-iterable NoneType". Now it raises a clear error.
     """
     now = datetime.now(timezone.utc)
-    future_events = [
-        e for e in events
-        if datetime.fromisoformat(e['deadline_time'].replace("Z", "+00:00")) > now
-    ]
+    future_events = [e for e in events if _parse_deadline(e) > now]
     if future_events:
-        next_event = min(
-            future_events,
-            key=lambda e: datetime.fromisoformat(e['deadline_time'].replace("Z", "+00:00"))
-        )
-        next_deadline = datetime.fromisoformat(
-            next_event['deadline_time'].replace("Z", "+00:00")
-        )
-        if next_deadline.date() == now.date():
+        next_event = min(future_events, key=_parse_deadline)
+        if _parse_deadline(next_event).date() == now.date():
             return "deadline", None
-    past_events = [
-        e for e in events
-        if datetime.fromisoformat(e['deadline_time'].replace("Z", "+00:00")) <= now
-    ]
+    past_events = [e for e in events if _parse_deadline(e) <= now]
     if past_events:
-        latest_event = max(
-            past_events,
-            key=lambda e: datetime.fromisoformat(e['deadline_time'].replace("Z", "+00:00"))
-        )
+        latest_event = max(past_events, key=_parse_deadline)
         if latest_event['finished']:
             return "post_gameweek", latest_event['id']
         return "live", None
+    raise ValueError(
+        "Could not determine snapshot type: no gameweek deadline has passed yet "
+        "(is the season not started?)"
+    )
 
 
 def determine_fixture_snapshot_type(fixture):

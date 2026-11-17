@@ -1,5 +1,5 @@
 from src.db_utils import get_connection
-from src.quality_checks.quality_utils import run_quality_check
+from src.quality_checks.quality_utils import run_quality_check, latest_snapshot_sql
 
 
 def check_bronze_players(conn):
@@ -24,10 +24,10 @@ def check_bronze_players(conn):
         conn,
         table_name="bronze_players",
         rule_name="required_keys_missing",
-        count_query="SELECT COUNT(*) FROM bronze_players",
-        failed_ids_query="""
+        count_query=f"SELECT COUNT(*) FROM {latest_snapshot_sql('bronze_players', 'player_id')}",
+        failed_ids_query=f"""
             SELECT player_id
-            FROM bronze_players
+            FROM {latest_snapshot_sql('bronze_players', 'player_id')}
             WHERE raw_json->>'id' IS NULL
                OR raw_json->>'web_name' IS NULL
                OR raw_json->>'element_type' IS NULL
@@ -42,16 +42,15 @@ def check_bronze_players(conn):
         conn,
         table_name="bronze_players",
         rule_name="invalid_status_value",
-        count_query="SELECT COUNT(*) FROM bronze_players",
-        failed_ids_query="""
+        count_query=f"SELECT COUNT(*) FROM {latest_snapshot_sql('bronze_players', 'player_id')}",
+        failed_ids_query=f"""
             SELECT player_id
-            FROM bronze_players
+            FROM {latest_snapshot_sql('bronze_players', 'player_id')}
             WHERE raw_json->>'status' NOT IN ('a', 'i', 'd', 's', 'u')
         """
     )
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    check_bronze_players(conn)
-    conn.close()
+    with get_connection() as conn:
+        check_bronze_players(conn)

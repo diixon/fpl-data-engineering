@@ -1,0 +1,8 @@
+# Force Unix line endings (LF) for files that run inside Linux containers.
+# Why: on Windows, Git/editors can save files with CRLF. A shell script with CRLF
+# fails inside Docker with errors like "bash\r: No such file or directory".
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+*.sql text eol=lf

@@ -1,5 +1,5 @@
 from src.db_utils import get_connection
-from src.quality_checks.quality_utils import run_quality_check
+from src.quality_checks.quality_utils import run_quality_check, latest_snapshot_sql
 
 
 def check_bronze_event(conn):
@@ -36,6 +36,5 @@ def check_bronze_event(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    check_bronze_event(conn)
-    conn.close()
+    with get_connection() as conn:
+        check_bronze_event(conn)

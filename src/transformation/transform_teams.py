@@ -1,4 +1,4 @@
-from src.db_utils import get_connection
+from src.db_utils import get_connection, latest_failed_ids_sql
 
 
 def transform_teams(conn):
@@ -21,7 +21,7 @@ def transform_teams(conn):
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             INSERT INTO silver_teams (
                 team_id, name, short_name, points, played, position, win,
                 draw, loss, load_date, source_run_id
@@ -46,12 +46,7 @@ def transform_teams(conn):
             ) t
             WHERE t.rn = 1
               AND t.team_id NOT IN (
-                  SELECT jsonb_array_elements(failed_ids)::TEXT::INT
-                  FROM quality_check_results
-                  WHERE table_name = 'bronze_teams'
-                    AND rule_name = 'required_keys_missing'
-                  ORDER BY checked_at DESC
-                  LIMIT 1
+                  {latest_failed_ids_sql('bronze_teams', 'required_keys_missing')}
               )
             ON CONFLICT (team_id) DO UPDATE SET
                 name          = EXCLUDED.name,
@@ -73,6 +68,5 @@ def transform_teams(conn):
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    transform_teams(conn)
-    conn.close()
+    with get_connection() as conn:
+        transform_teams(conn)

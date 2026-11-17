@@ -1,9 +1,17 @@
-# Airflow Logs
+# Airflow logs
 logs/
 
-# Python Cache
+# Python
 __pycache__/
 *.pyc
+venv/
+.venv/
 
-# Environment Variables
+# Environment variables (secrets) - only .env.example is committed
 .env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.log
