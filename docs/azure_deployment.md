@@ -30,7 +30,7 @@ I chose Azure because it is a common platform in Data Engineering jobs, and beca
 ## 2. Airflow (Azure Virtual Machine)
 
 1. Create a **Linux VM**: Ubuntu Server 22.04 LTS, a size with **at least 4 GB RAM** (Airflow with LocalExecutor is slow or unstable below that), SSH key login.
-2. Network security rules: allow SSH (22) **only from my IP**, and the Airflow UI (8080) **only from my IP**. Port 8080 open to the whole internet would expose an Airflow login to everyone.
+2. Network security rules: allow SSH (22) **only from my IP**, and nothing else. I do **not** open port 8080: `docker-compose.yml` binds the Airflow UI to `127.0.0.1`, so it is reached through an SSH tunnel (step 7). An Airflow login open to the internet could run commands on the VM.
 3. Add the VM's public IP to the PostgreSQL firewall rules (step 1.4).
 4. Connect and install Docker (the official script installs Docker Engine and the `docker compose` plugin):
 
@@ -53,7 +53,13 @@ I chose Azure because it is a common platform in Data Engineering jobs, and beca
 
    ```text
    DOCKER_DB_HOST=<server-name>.postgres.database.azure.com
+   AIRFLOW_ADMIN_PASSWORD=<a strong password>
+   AIRFLOW_FERNET_KEY=<generate with: openssl rand -base64 32 | tr '+/' '-_'>
+   AIRFLOW_WEBSERVER_SECRET_KEY=<generate with: openssl rand -hex 32>
+   AIRFLOW_UID=<output of: id -u>
    ```
+
+   Also run `mkdir -p logs` before the first start (`logs/` is in `.gitignore`, so the clone does not have it).
 
    `DOCKER_DB_HOST` is the address the containers use for my FPL data (locally it defaults to the `postgres` container). The local Postgres container still starts on the VM, but it only holds Airflow's own metadata there.
 
@@ -63,7 +69,7 @@ I chose Azure because it is a common platform in Data Engineering jobs, and beca
    docker compose up -d --build
    ```
 
-7. Open `http://<vm-public-ip>:8080`, log in with `admin` / `admin`, and **change the admin password immediately** (the default is only safe on my own laptop). Then turn the `fpl_data_pipeline` DAG on and trigger it.
+7. From my own computer, open an SSH tunnel: `ssh -L 8080:localhost:8080 azureuser@<vm-public-ip>`. While it is open, go to `http://localhost:8080` and log in with `admin` and the `AIRFLOW_ADMIN_PASSWORD` from `.env`. Then turn the `fpl_data_pipeline` DAG on and trigger it.
 
 ## 3. Check that it works
 

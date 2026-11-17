@@ -15,7 +15,7 @@ default_args = {
 def python_task(task_id, module):
     """
     Every task in this pipeline is "run one Python module from /opt/airflow".
-    I wrote that BashOperator once here instead of 16 times, so a change
+    I wrote that BashOperator once here instead of 18 times, so a change
     (for example a timeout) is made in one place. The task_ids are exactly
     the same as before, so old run history in the Airflow UI still matches.
     """

@@ -67,6 +67,15 @@ The pipeline runs locally via Docker Compose. I also wrote the deployment plan f
 
 See the full step-by-step guide in [`docs/azure_deployment.md`](docs/azure_deployment.md).
 
+## Security Settings
+
+How `docker-compose.yml` handles ports and secrets (the first two points keep a server closed to the internet; the third needs my own values on a server):
+
+- **Ports are bound to `127.0.0.1`** (Postgres and the Airflow UI). Only the machine itself can reach them. On a remote server they are reached through an SSH tunnel (DBeaver has an SSH tab; for the UI: `ssh -L 8080:localhost:8080 user@server`).
+- **No admin password in the code.** `AIRFLOW_ADMIN_PASSWORD` is read from `.env`. The admin user is created only on a fresh Airflow database, so changing the variable later does not change an existing user's password.
+- **`AIRFLOW_FERNET_KEY`** (encrypts stored connections/variables) and **`AIRFLOW_WEBSERVER_SECRET_KEY`** have local-development defaults. On a server I set my own values in `.env`.
+- `.env` is never committed.
+
 ## Project Structure
 
 ```text
@@ -81,7 +90,7 @@ sql/
 src/
 ├── db_utils.py             # shared database connection and shared ingestion logic
 ├── ingestion/              # scripts that pull data from the FPL API into Bronze
-├── quality_checks/         # Gate 1 data quality checks (Bronze layer)
+├── quality_checks/         # Gate 1 checks (Bronze) + Gate 2 reconciliation (Silver vs Gold)
 └── transformation/         # Bronze to Silver to Gold logic
 
 tests/                      # pytest tests (run on temporary schemas built from my real SQL files)
@@ -116,17 +125,19 @@ Docker Desktop installed and running.
 cp .env.example .env
 ```
 
+   Then make sure `.env` also contains `AIRFLOW_ADMIN_PASSWORD=...` (choose any password). `docker compose` stops with an error message if it is missing, on purpose: there is no default admin password in the code.
+
 3. Start the containers:
 
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
-4. Wait for Airflow to initialize. Then, access the Airflow UI at http://localhost:8080 (Username: admin, Password: admin).
+4. Wait for Airflow to initialize. Then, access the Airflow UI at http://localhost:8080 (Username: `admin`, Password: the value of `AIRFLOW_ADMIN_PASSWORD` in your `.env`).
 
 5. In the Airflow UI, turn the `fpl_data_pipeline` DAG **on** (the toggle on the left - DAGs start paused), then trigger it to run the entire pipeline.
 
-To stop everything: `docker-compose down`. To also delete the database data and re-run the SQL init scripts from scratch: `docker-compose down -v`.
+To stop everything: `docker compose down`. To also delete the database data and re-run the SQL init scripts from scratch: `docker compose down -v`.
 
 ### Connect with DBeaver
 
@@ -145,7 +156,7 @@ The tests run against a real PostgreSQL, but inside a temporary schema that is c
 
 ```bash
 pip install -r requirements-dev.txt
-docker-compose up -d postgres      # needs DB_HOST=localhost in .env
+docker compose up -d postgres      # needs DB_HOST=localhost in .env
 pytest
 ```
 
@@ -164,7 +175,7 @@ I list these on purpose - they are decisions I understand, not surprises.
 
 ## Current Progress
 
-- ☑ Full database design (Bronze, Silver, Gold - 16 tables)
+- ☑ Full database design (17 tables: 6 Bronze, 5 Silver, 5 Gold, `quality_check_results`)
 - ☑ Bronze ingestion for all three FPL API endpoints
 - ☑ Dynamic snapshot_type logic
 - ☑ Reusable, DRY ingestion functions shared across scripts
